@@ -39,7 +39,10 @@
   }
 }
 
-body {
-  @apply bg-bg text-text-main font-sans;
-  background: radial-gradient(circle at top left, #1e293b, #0f172a);
+@layer base {
+  body {
+    @apply bg-bg text-text-main font-sans;
+    background: radial-gradient(circle at top left, #1e293b, #0f172a);
+    min-height: 100vh;
+  }
 }

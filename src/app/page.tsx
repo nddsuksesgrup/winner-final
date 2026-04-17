@@ -1,4 +1,6 @@
-import React, { useState } from 'react';
+"use client";
+
+import React, { useState, useEffect } from 'react';
 import { 
   Search, 
   Brain, 
@@ -16,12 +18,15 @@ import {
   AlertCircle
 } from 'lucide-react';
 import { motion, AnimatePresence } from 'motion/react';
-import { cn } from './lib/utils';
+import { cn } from '../lib/utils';
 import { 
   AgentStatus, 
   WorkflowState, 
-} from './types';
-import { geminiService } from './services/geminiService';
+} from '../types';
+import { geminiService } from '../services/geminiService';
+import { supabase } from '../lib/supabase';
+import { wahaService } from '../services/wahaService';
+import { agentService } from '../services/agentService';
 
 const STEPS = [
   { id: 1, name: 'Keyword Agent', icon: Search, color: 'text-blue-600' },
@@ -34,9 +39,38 @@ const STEPS = [
   { id: 8, name: 'Rating Agent', icon: Star, color: 'text-yellow-600' },
 ];
 
-export default function App() {
+// JSON Helper untuk LangGraph VPS
+const parseAgentOutput = (raw: string | undefined | null, stepName: string) => {
+  if (!raw) return undefined;
+  if (typeof raw !== 'string') return raw;
+  try {
+    const cleaned = raw.replace(/```json/g, '').replace(/```/g, '').trim();
+    return JSON.parse(cleaned);
+  } catch (e) {
+    console.warn(`Failed to parse ${stepName} output JSON. Falling back to raw text.`);
+    // Jika gagal di-parse, berarti LLM membalas dengan teks biasa (bukan JSON)
+    // Kita bungkus teks biasa tersebut ke dalam struktur yang aman untuk ditampilkan
+    if (stepName === 'writing') {
+      return {
+        title: "Draf Artikel (Raw Text)",
+        intro: "",
+        sections: [{ heading: "Konten", content: raw }],
+        closing: "",
+        cta: ""
+      };
+    } else if (stepName === 'strategy') {
+      return { goal: "Raw Output", painPoints: [], uniqueAngle: "Raw Output", ctaDirection: "", structure: [raw] };
+    } else if (stepName === 'keyword') {
+      return { primaryKeyword: "Raw Keyword", secondaryKeywords: [], searchIntent: "", targetAudience: "", keywordAngle: "", recommendedTitles: [raw] };
+    }
+    return { raw };
+  }
+};
+
+export default function Home() {
   const [activeView, setActiveView] = useState<'dashboard' | 'history' | 'settings' | 'login' | 'signup'>('dashboard');
   const [isAuthenticated, setIsAuthenticated] = useState(false);
+  const [feedback, setFeedback] = useState('');
   const [state, setState] = useState<WorkflowState>({
     currentStep: 0,
     niche: '',
@@ -44,9 +78,34 @@ export default function App() {
     results: {},
     statuses: Array(8).fill(AgentStatus.IDLE),
   });
-
+  const [history, setHistory] = useState<any[]>([]);
   const [isStarted, setIsStarted] = useState(false);
   const [error, setError] = useState<string | null>(null);
+  const [loading, setLoading] = useState(false);
+
+  useEffect(() => {
+    supabase.auth.getSession().then(({ data: { session } }) => {
+      setIsAuthenticated(!!session);
+      if (session) fetchHistory();
+    });
+
+    const { data: { subscription } } = supabase.auth.onAuthStateChange((_event, session) => {
+      setIsAuthenticated(!!session);
+      if (session) fetchHistory();
+    });
+
+    return () => subscription.unsubscribe();
+  }, []);
+
+  const fetchHistory = async () => {
+    const { data, error } = await supabase
+      .from('articles')
+      .select('*')
+      .order('created_at', { ascending: false });
+    
+    if (data) setHistory(data);
+    if (error) console.error('Error fetching history:', error);
+  };
 
   const updateStatus = (stepIndex: number, status: AgentStatus) => {
     setState(prev => {
@@ -54,6 +113,67 @@ export default function App() {
       newStatuses[stepIndex] = status;
       return { ...prev, statuses: newStatuses };
     });
+  };
+
+  const processAgentResponse = async (response: any, phone: string | undefined) => {
+    if (response && response.state) {
+      const parsedResults = {
+        keyword: parseAgentOutput(response.state.results.keyword, 'keyword'),
+        strategy: parseAgentOutput(response.state.results.strategy, 'strategy'),
+        writing: parseAgentOutput(response.state.results.writing, 'writing'),
+        image: parseAgentOutput(response.state.results.image, 'image'),
+        revision: parseAgentOutput(response.state.results.revision, 'revision'),
+        seo: parseAgentOutput(response.state.results.seo, 'seo'),
+        publish: parseAgentOutput(response.state.results.publish, 'publish'),
+        rating: parseAgentOutput(response.state.results.rating, 'rating'),
+      };
+
+      const currentStepStr = response.state.current_step;
+      const stepMapping: Record<string, number> = {
+        "keyword": 1, "strategy": 2, "writing": 3, "image": 4, 
+        "revision": 5, "seo": 6, "publish": 7, "rating": 8, "end": 8
+      };
+      // Jika di-pause setelah writing, kita ada di step 3
+      let newStep = stepMapping[currentStepStr] || 8;
+      if (response.is_paused) {
+        newStep = 3; // Menyesuaikan dengan pause point di main.py (setelah writing)
+      }
+
+      setState(prev => ({
+        ...prev,
+        results: parsedResults,
+        statuses: Array(8).fill(AgentStatus.IDLE).map((_, i) => i < newStep ? AgentStatus.COMPLETED : AgentStatus.IDLE),
+        currentStep: newStep,
+        thread_id: response.thread_id,
+        isPaused: response.is_paused
+      }));
+
+      if (!response.is_paused && phone && parsedResults.writing) {
+        try {
+          await wahaService.sendNotification(phone, `✅ Artikel Berhasil Dihasilkan: ${parsedResults.writing.title}`);
+        } catch (e) {
+          console.warn("Gagal mengirim notifikasi WA akhir...", e);
+        }
+      }
+
+      // Save to Supabase History jika sudah selesai
+      if (!response.is_paused) {
+        const { data: { user } } = await supabase.auth.getUser();
+        if (user && parsedResults.writing) {
+          await supabase.from('articles').insert({
+            user_id: user.id,
+            title: parsedResults.writing.title,
+            niche: state.niche,
+            content: parsedResults.writing,
+            seo_data: parsedResults.seo || {},
+            status: 'published'
+          });
+          fetchHistory();
+        }
+      }
+    } else {
+      throw new Error("Invalid response from agent");
+    }
   };
 
   const runWorkflow = async () => {
@@ -64,63 +184,63 @@ export default function App() {
 
     setError(null);
     setIsStarted(true);
-    setState(prev => ({ ...prev, currentStep: 1 }));
+    setLoading(true);
+    setState(prev => ({ ...prev, currentStep: 1, isPaused: false }));
 
     try {
-      // Step 1: Keyword Agent
-      updateStatus(0, AgentStatus.RUNNING);
-      const keyword = await geminiService.runKeywordAgent(state.niche, state.targetMarket);
-      setState(prev => ({ ...prev, results: { ...prev.results, keyword }, currentStep: 2 }));
-      updateStatus(0, AgentStatus.COMPLETED);
+      const phone = process.env.NEXT_PUBLIC_NOTIFICATION_PHONE;
+      if (phone) {
+        try {
+          await wahaService.sendNotification(phone, `🚀 Memulai Workflow WINNER via LangGraph VPS\nNiche: ${state.niche}\nTarget: ${state.targetMarket}`);
+        } catch (e) {
+          console.warn("Gagal mengirim notifikasi WA awal, lanjut proses...", e);
+        }
+      }
 
-      // Step 2: Strategy Agent
-      updateStatus(1, AgentStatus.RUNNING);
-      const strategy = await geminiService.runStrategyAgent(keyword);
-      setState(prev => ({ ...prev, results: { ...prev.results, strategy }, currentStep: 3 }));
-      updateStatus(1, AgentStatus.COMPLETED);
+      setState(prev => ({ 
+        ...prev, 
+        statuses: prev.statuses.map((_, i) => i === 0 ? AgentStatus.RUNNING : AgentStatus.IDLE) 
+      }));
 
-      // Step 3: Writing Agent
-      updateStatus(2, AgentStatus.RUNNING);
-      const writing = await geminiService.runWritingAgent(strategy);
-      setState(prev => ({ ...prev, results: { ...prev.results, writing }, currentStep: 4 }));
-      updateStatus(2, AgentStatus.COMPLETED);
+      const response = await agentService.runLangGraphAgent("start", {
+        niche: state.niche,
+        target_market: state.targetMarket
+      });
 
-      // Step 4: Image Agent
-      updateStatus(3, AgentStatus.RUNNING);
-      const image = await geminiService.runImageAgent(writing);
-      setState(prev => ({ ...prev, results: { ...prev.results, image }, currentStep: 5 }));
-      updateStatus(3, AgentStatus.COMPLETED);
+      await processAgentResponse(response, phone);
 
-      // Step 5: Revision Agent
-      updateStatus(4, AgentStatus.RUNNING);
-      const revision = await geminiService.runRevisionAgent(writing, image);
-      setState(prev => ({ ...prev, results: { ...prev.results, revision }, currentStep: 6 }));
-      updateStatus(4, AgentStatus.COMPLETED);
-
-      // Step 6: SEO Agent
-      updateStatus(5, AgentStatus.RUNNING);
-      const seo = await geminiService.runSEOAgent(writing);
-      setState(prev => ({ ...prev, results: { ...prev.results, seo }, currentStep: 7 }));
-      updateStatus(5, AgentStatus.COMPLETED);
-
-      // Step 7: Publish Agent
-      updateStatus(6, AgentStatus.RUNNING);
-      const publish = await geminiService.runPublishAgent({ writing, image, seo });
-      setState(prev => ({ ...prev, results: { ...prev.results, publish }, currentStep: 8 }));
-      updateStatus(6, AgentStatus.COMPLETED);
-
-      // Step 8: Rating Agent
-      updateStatus(7, AgentStatus.RUNNING);
-      const rating = await geminiService.runRatingAgent({ writing, image, seo, publish });
-      setState(prev => ({ ...prev, results: { ...prev.results, rating } }));
-      updateStatus(7, AgentStatus.COMPLETED);
-
-    } catch (err) {
-      console.error(err);
-      setError('Terjadi kesalahan saat menjalankan agent. Silakan coba lagi.');
+    } catch (err: any) {
+      console.error('Workflow Error:', err);
+      setError(`Terjadi kesalahan pada VPS: ${err.message || 'Unknown Error'}`);
       setIsStarted(false);
+    } finally {
+      setLoading(false);
     }
   };
+
+  const resumeWorkflow = async (action: 'APPROVE' | 'REVISE') => {
+    if (!state.thread_id) return;
+    setError(null);
+    setLoading(true);
+    setState(prev => ({ ...prev, isPaused: false })); // Hilangkan pause sementara
+
+    try {
+      const phone = process.env.NEXT_PUBLIC_NOTIFICATION_PHONE;
+      const response = await agentService.runLangGraphAgent("resume", {
+        thread_id: state.thread_id,
+        user_action: action,
+        feedback: feedback
+      });
+      setFeedback(''); // reset
+      await processAgentResponse(response, phone);
+    } catch (err: any) {
+      console.error('Resume Error:', err);
+      setError(`Gagal melanjutkan agen: ${err.message || 'Unknown Error'}`);
+    } finally {
+      setLoading(false);
+    }
+  };
+
 
   const handleStart = () => {
     if (!isAuthenticated) {
@@ -131,7 +251,7 @@ export default function App() {
   };
 
   return (
-    <div className="min-h-screen bg-bg text-text-main font-sans selection:bg-primary/30">
+    <div className="min-h-screen font-sans selection:bg-primary/30">
       {/* Header */}
       <header className="fixed top-0 left-0 right-0 h-[70px] bg-panel/20 backdrop-blur-xl border-b border-white/10 flex items-center justify-between px-8 z-50">
         <div className="flex items-center gap-3">
@@ -172,7 +292,20 @@ export default function App() {
               </button>
             </>
           ) : (
-            <button className="px-5 py-2 bg-white/10 hover:bg-white/20 rounded-full text-[10px] font-bold uppercase tracking-widest text-white transition-all">Profile</button>
+            <div className="flex items-center gap-4">
+              <button 
+                onClick={async () => {
+                  await supabase.auth.signOut();
+                  setIsAuthenticated(false);
+                  setActiveView('dashboard');
+                  setIsStarted(false);
+                }}
+                className="text-[10px] font-bold uppercase tracking-widest text-text-muted hover:text-red-400 transition-colors"
+              >
+                Logout
+              </button>
+              <button className="px-5 py-2 bg-white/10 hover:bg-white/20 rounded-full text-[10px] font-bold uppercase tracking-widest text-white transition-all">Profile</button>
+            </div>
           )}
         </div>
       </header>
@@ -254,10 +387,35 @@ export default function App() {
         ) : activeView === 'history' ? (
           <div className="p-10 max-w-5xl mx-auto">
             <h2 className="text-3xl font-black italic tracking-tighter mb-8 text-primary">ARTICLE HISTORY</h2>
-            <div className="glass-panel rounded-3xl p-20 text-center">
-              <History className="w-16 h-16 text-white/20 mx-auto mb-6" />
-              <p className="text-text-muted font-medium">Belum ada riwayat artikel. Mulai buat artikel pertama Anda!</p>
-            </div>
+            {history.length > 0 ? (
+              <div className="grid grid-cols-1 md:grid-cols-2 gap-6">
+                {history.map((art) => (
+                  <div key={art.id} className="glass-panel rounded-3xl p-6 border border-white/10 hover:border-primary/50 transition-all group">
+                    <div className="flex justify-between items-start mb-4">
+                      <div>
+                        <p className="text-[10px] font-black text-primary uppercase tracking-widest mb-1">{art.niche}</p>
+                        <h3 className="text-lg font-bold text-white leading-tight">{art.title}</h3>
+                      </div>
+                      <span className="px-3 py-1 bg-success/10 text-success text-[9px] font-black uppercase rounded-full border border-success/20">
+                        {art.status}
+                      </span>
+                    </div>
+                    <p className="text-xs text-text-muted mb-6 line-clamp-3">{art.content?.intro}</p>
+                    <div className="flex items-center justify-between pt-4 border-t border-white/5">
+                      <span className="text-[9px] font-bold text-white/20 uppercase">{new Date(art.created_at).toLocaleDateString()}</span>
+                      <button className="text-[10px] font-black text-primary uppercase tracking-widest group-hover:translate-x-1 transition-transform flex items-center gap-2">
+                        View Article <ArrowRight className="w-3 h-3" />
+                      </button>
+                    </div>
+                  </div>
+                ))}
+              </div>
+            ) : (
+              <div className="glass-panel rounded-3xl p-20 text-center">
+                <History className="w-16 h-16 text-white/20 mx-auto mb-6" />
+                <p className="text-text-muted font-medium">Belum ada riwayat artikel. Mulai buat artikel pertama Anda!</p>
+              </div>
+            )}
           </div>
         ) : activeView === 'settings' ? (
           <div className="p-10 max-w-5xl mx-auto">
@@ -328,7 +486,7 @@ export default function App() {
                   </header>
 
                   <div className="space-y-6">
-                    {renderStepOutput(state)}
+                    {renderStepOutput(state, feedback, setFeedback, resumeWorkflow)}
                   </div>
                 </motion.div>
               </AnimatePresence>
@@ -365,7 +523,7 @@ export default function App() {
                     </li>
                   </ul>
                   <div className="mt-4 p-3 bg-amber-50 rounded border border-amber-100 text-[11px] text-amber-800">
-                    <strong>Suggestion:</strong> {state.results.rating.improvementSuggestions[0]}
+                    <strong>Suggestion:</strong> {state.results.rating.improvementSuggestions?.[0] || 'Keep up the good work!'}
                   </div>
                 </div>
               )}
@@ -377,6 +535,7 @@ export default function App() {
   );
 }
 
+// Sub-components
 interface NavItemProps {
   icon: React.ElementType;
   label: string;
@@ -442,7 +601,6 @@ const StepItem: React.FC<StepItemProps> = ({ step, status, active, onClick }) =>
 function LandingView({ niche, targetMarket, setNiche, setTargetMarket, onStart, error }: any) {
   return (
     <div className="relative min-h-[calc(100vh-70px)] flex items-center justify-center overflow-hidden py-20 px-6">
-      {/* Background Decorative Elements */}
       <div className="absolute top-1/4 left-1/4 w-96 h-96 bg-primary/20 blur-[120px] rounded-full animate-pulse" />
       <div className="absolute bottom-1/4 right-1/4 w-[500px] h-[500px] bg-accent/20 blur-[150px] rounded-full animate-pulse delay-700" />
       
@@ -464,13 +622,6 @@ function LandingView({ niche, targetMarket, setNiche, setTargetMarket, onStart, 
           <p className="text-lg text-text-muted max-w-lg leading-relaxed font-medium">
             Platform multi-agent profesional untuk menghasilkan, mereview, dan mempublikasikan artikel SEO berkualitas tinggi secara otomatis.
           </p>
-
-          <div className="flex items-center gap-8 text-white/40 text-[11px] font-black uppercase tracking-widest">
-            <div className="flex flex-col gap-1"><span>01</span><div className="w-8 h-0.5 bg-primary" /></div>
-            <div className="flex flex-col gap-1"><span>02</span><div className="w-8 h-0.5 bg-white/10" /></div>
-            <div className="flex flex-col gap-1"><span>03</span><div className="w-8 h-0.5 bg-white/10" /></div>
-            <div className="flex flex-col gap-1"><span>04</span><div className="w-8 h-0.5 bg-white/10" /></div>
-          </div>
         </motion.div>
 
         <motion.div
@@ -520,25 +671,18 @@ function LandingView({ niche, targetMarket, setNiche, setTargetMarket, onStart, 
               </button>
             </div>
           </div>
-
-          {/* Floating 3D-like elements */}
-          <div className="absolute -top-10 -right-10 w-32 h-32 bg-accent rounded-full blur-[80px] opacity-50" />
-          <div className="absolute -bottom-10 -left-10 w-40 h-40 bg-primary rounded-full blur-[100px] opacity-50" />
         </motion.div>
       </div>
     </div>
   );
 }
 
-function FeatureCard({ label }: { label: string }) {
-  return (
-    <div className="p-4 bg-slate-800/20 rounded-2xl border border-slate-800/50 text-sm font-medium text-slate-400">
-      {label}
-    </div>
-  );
-}
-
-function renderStepOutput(state: WorkflowState) {
+function renderStepOutput(
+  state: WorkflowState, 
+  feedback: string, 
+  setFeedback: (v: string) => void, 
+  resumeWorkflow: (action: 'APPROVE' | 'REVISE') => void
+) {
   const { currentStep, results } = state;
 
   if (currentStep === 1 && results.keyword) {
@@ -554,8 +698,8 @@ function renderStepOutput(state: WorkflowState) {
         <div>
           <label className="text-[11px] font-bold text-text-muted uppercase tracking-widest mb-3 block">Recommended Titles</label>
           <div className="space-y-2">
-            {k.recommendedTitles.map((t, i) => (
-              <div key={i} className="p-3 bg-slate-50 rounded border border-border text-xs text-text-main">
+            {k.recommendedTitles?.map((t: string, i: number) => (
+              <div key={i} className="p-3 bg-white/5 rounded border border-white/10 text-xs text-white">
                 {t}
               </div>
             ))}
@@ -577,8 +721,8 @@ function renderStepOutput(state: WorkflowState) {
         <div>
           <label className="text-[11px] font-bold text-text-muted uppercase tracking-widest mb-3 block">Pain Points</label>
           <div className="flex flex-wrap gap-2">
-            {s.painPoints.map((p, i) => (
-              <span key={i} className="px-3 py-1 bg-red-50 text-red-600 border border-red-100 rounded text-[10px] font-bold">
+            {s.painPoints?.map((p: string, i: number) => (
+              <span key={i} className="px-3 py-1 bg-red-500/10 text-red-400 border border-red-500/20 rounded text-[10px] font-bold">
                 {p}
               </span>
             ))}
@@ -587,9 +731,9 @@ function renderStepOutput(state: WorkflowState) {
         <div>
           <label className="text-[11px] font-bold text-text-muted uppercase tracking-widest mb-3 block">Struktur Artikel</label>
           <div className="space-y-2">
-            {s.structure.map((st, i) => (
+            {s.structure?.map((st: string, i: number) => (
               <div key={i} className="flex items-center gap-3 text-xs text-text-muted">
-                <div className="w-5 h-5 rounded-full bg-slate-100 flex items-center justify-center text-[10px] font-bold text-text-main">{i + 1}</div>
+                <div className="w-5 h-5 rounded-full bg-white/5 flex items-center justify-center text-[10px] font-bold text-white">{i + 1}</div>
                 {st}
               </div>
             ))}
@@ -599,18 +743,18 @@ function renderStepOutput(state: WorkflowState) {
     );
   }
 
-  if (currentStep === 3 && results.writing) {
+  if (currentStep >= 3 && results.writing) {
     const w = results.writing;
     return (
       <div className="space-y-6 max-h-[500px] overflow-y-auto pr-4 custom-scrollbar">
-        <h4 className="text-xl font-bold text-text-main">{w.title}</h4>
+        <h4 className="text-xl font-bold text-white">{w.title}</h4>
         <p className="text-text-muted text-sm leading-relaxed italic border-l-2 border-primary pl-4">{w.intro}</p>
         <div className="space-y-8">
-          {w.sections.map((sec, i) => (
+          {w.sections?.map((sec: any, i: number) => (
             <div key={i} className="space-y-3">
-              <h5 className="text-base font-bold text-text-main">{sec.heading}</h5>
+              <h5 className="text-base font-bold text-white">{sec.heading}</h5>
               <div className="text-text-muted text-sm leading-relaxed space-y-4">
-                {sec.content.split('\n').map((p, pi) => (
+                {sec.content?.split('\n')?.map((p: string, pi: number) => (
                   <p key={pi}>{p}</p>
                 ))}
               </div>
@@ -618,181 +762,54 @@ function renderStepOutput(state: WorkflowState) {
           ))}
         </div>
         <div className="p-6 bg-primary/5 border border-primary/10 rounded-lg">
-          <p className="text-text-main text-sm mb-4">{w.closing}</p>
-          <button className="px-6 py-2 bg-primary text-white rounded font-bold text-xs shadow-md shadow-primary/10">
+          <p className="text-white text-sm mb-4">{w.closing}</p>
+          <button className="px-6 py-2 bg-primary text-bg rounded font-bold text-xs shadow-md shadow-primary/10">
             {w.cta}
           </button>
         </div>
-      </div>
-    );
-  }
 
-  if (currentStep === 4 && results.image) {
-    const img = results.image;
-    return (
-      <div className="space-y-6">
-        <div className="p-4 bg-slate-50 rounded border border-border">
-          <label className="text-[11px] font-bold text-text-muted uppercase tracking-widest mb-2 block">Featured Image Prompt</label>
-          <p className="text-xs text-text-main leading-relaxed">{img.featuredImagePrompt}</p>
-        </div>
-        <div className="grid grid-cols-2 gap-4">
-          <DataBox label="SEO Filename" value={img.seo.filename} />
-          <DataBox label="Alt Text" value={img.seo.altText} />
-        </div>
-        <div>
-          <label className="text-[11px] font-bold text-text-muted uppercase tracking-widest mb-3 block">Section Image Prompts</label>
-          <div className="space-y-3">
-            {img.sectionImagePrompts.map((p, i) => (
-              <div key={i} className="p-3 bg-slate-50 rounded border border-border text-[11px] text-text-muted">
-                <span className="font-bold text-primary mr-2">Section {i + 1}:</span> {p}
+        {/* Human in the loop Pause UI */}
+        {state.isPaused && (
+          <div className="mt-8 p-6 bg-white/5 border-2 border-primary/50 rounded-2xl">
+            <h3 className="text-primary font-bold text-lg mb-2">Tinjauan Manual Diperlukan</h3>
+            <p className="text-text-muted text-sm mb-4">Agen telah selesai menulis draf awal. Silakan review artikel di atas. Apakah Anda ingin melanjutkan publikasi atau merevisi?</p>
+            <div className="space-y-4">
+              <textarea 
+                className="w-full bg-black/30 border border-white/10 rounded-lg p-3 text-sm text-white placeholder:text-white/30 focus:outline-none focus:border-primary/50"
+                placeholder="Catatan revisi (opsional)... misal: 'Tolong buat paragraf pertama lebih panjang'"
+                rows={3}
+                value={feedback}
+                onChange={e => setFeedback(e.target.value)}
+              />
+              <div className="flex gap-4">
+                <button 
+                  onClick={() => resumeWorkflow('REVISE')}
+                  className="flex-1 py-3 bg-white/5 border border-white/10 rounded-lg text-white font-bold hover:bg-white/10 transition"
+                >
+                  Revisi
+                </button>
+                <button 
+                  onClick={() => resumeWorkflow('APPROVE')}
+                  className="flex-1 py-3 bg-primary text-bg rounded-lg font-bold shadow-lg shadow-primary/20 hover:shadow-primary/40 transition"
+                >
+                  Approve & Lanjut
+                </button>
               </div>
-            ))}
-          </div>
-        </div>
-      </div>
-    );
-  }
-
-  if (currentStep === 5 && results.revision) {
-    const r = results.revision;
-    return (
-      <div className="space-y-8">
-        <div className={cn(
-          "p-6 rounded-lg border flex items-center justify-between",
-          r.status === 'LULUS' ? "bg-success/5 border-success/20" : "bg-red-50 border-red-100"
-        )}>
-          <div>
-            <p className="text-[10px] font-bold uppercase tracking-widest text-text-muted mb-1">Status Akhir</p>
-            <h4 className={cn("text-2xl font-black", r.status === 'LULUS' ? "text-success" : "text-red-600")}>
-              {r.status}
-            </h4>
-          </div>
-          {r.status === 'LULUS' ? <CheckCircle2 className="w-10 h-10 text-success" /> : <RefreshCw className="w-10 h-10 text-red-500" />}
-        </div>
-
-        <div className="grid grid-cols-1 md:grid-cols-2 gap-2">
-          <CheckItem label="Grammar & Spelling" checked={r.checklist.grammar} />
-          <CheckItem label="Flow & Readability" checked={r.checklist.flow} />
-          <CheckItem label="Natural Tone" checked={r.checklist.natural} />
-          <CheckItem label="Clear CTA" checked={r.checklist.ctaClear} />
-          <CheckItem label="Human-like Content" checked={r.checklist.notTooAI} />
-        </div>
-
-        {r.feedback && (
-          <div className="p-4 bg-slate-50 rounded border border-border">
-            <label className="text-[11px] font-bold text-text-muted uppercase tracking-widest mb-2 block">Agent Feedback</label>
-            <p className="text-xs text-text-muted italic">"{r.feedback}"</p>
+            </div>
           </div>
         )}
       </div>
     );
   }
 
-  if (currentStep === 6 && results.seo) {
-    const s = results.seo;
-    return (
-      <div className="space-y-6">
-        <DataBox label="Meta Title" value={s.metaTitle} />
-        <DataBox label="Meta Description" value={s.metaDescription} />
-        <DataBox label="Slug URL" value={s.slug} />
-        <div className="grid grid-cols-2 gap-6">
-          <div>
-            <label className="text-[11px] font-bold text-text-muted uppercase tracking-widest mb-3 block">Keyword Placement</label>
-            <div className="space-y-2">
-              {s.keywordPlacement.map((k, i) => (
-                <div key={i} className="text-[11px] text-text-muted flex items-center gap-2">
-                  <div className="w-1.5 h-1.5 rounded-full bg-primary" />
-                  {k}
-                </div>
-              ))}
-            </div>
-          </div>
-          <div>
-            <label className="text-[11px] font-bold text-text-muted uppercase tracking-widest mb-3 block">Internal Link Suggestions</label>
-            <div className="space-y-2">
-              {s.internalLinkSuggestions.map((l, i) => (
-                <div key={i} className="text-[11px] text-text-muted flex items-center gap-2">
-                  <div className="w-1.5 h-1.5 rounded-full bg-success" />
-                  {l}
-                </div>
-              ))}
-            </div>
-          </div>
-        </div>
-      </div>
-    );
-  }
-
-  if (currentStep === 7 && results.publish) {
-    const p = results.publish;
-    return (
-      <div className="flex flex-col items-center justify-center h-full space-y-6 text-center py-12">
-        <div className="w-16 h-16 bg-success/10 rounded-full flex items-center justify-center">
-          <Rocket className="w-8 h-8 text-success" />
-        </div>
-        <div>
-          <h4 className="text-2xl font-bold text-text-main mb-2">Artikel Berhasil Dipublish!</h4>
-          <p className="text-text-muted text-sm">Semua sistem berjalan normal dan artikel telah online.</p>
-        </div>
-        <div className="w-full max-w-md space-y-1">
-          <CheckItem label="Article Uploaded" checked={p.checklist.uploaded} />
-          <CheckItem label="Images Optimized" checked={p.checklist.imagesWebp} />
-          <CheckItem label="Links Validated" checked={p.checklist.linksActive} />
-          <CheckItem label="Metadata Set" checked={p.checklist.tagsSet} />
-        </div>
-        <button className="px-6 py-3 bg-text-main hover:bg-slate-800 text-white rounded font-bold text-xs transition-colors">
-          Lihat Artikel Live
-        </button>
-      </div>
-    );
-  }
-
-  if (currentStep === 8 && results.rating) {
-    const r = results.rating;
-    return (
-      <div className="space-y-8">
-        <div className="grid grid-cols-3 gap-4">
-          <ScoreCard label="SEO Score" score={r.seoScore} color="text-primary" />
-          <ScoreCard label="Readability" score={r.readabilityScore} color="text-success" />
-          <ScoreCard label="Conversion" score={r.conversionScore} color="text-accent" />
-        </div>
-
-        <div>
-          <label className="text-[11px] font-bold text-text-muted uppercase tracking-widest mb-4 block">Improvement Suggestions</label>
-          <div className="space-y-3">
-            {r.improvementSuggestions.map((s, i) => (
-              <div key={i} className="p-4 bg-amber-50 border border-amber-100 rounded flex items-start gap-3">
-                <AlertCircle className="w-4 h-4 text-amber-600 shrink-0 mt-0.5" />
-                <p className="text-xs text-amber-900">{s}</p>
-              </div>
-            ))}
-          </div>
-        </div>
-
-        <div className="pt-4 flex gap-4">
-          <button className="flex-1 py-3 bg-primary text-white rounded font-bold text-xs shadow-lg shadow-primary/10">
-            Download PDF Report
-          </button>
-          <button className="flex-1 py-3 bg-text-main text-white rounded font-bold text-xs">
-            Mulai Sesi Baru
-          </button>
-        </div>
-      </div>
-    );
-  }
-
   return (
-    <div className="flex flex-col items-center justify-center h-full text-center space-y-4 py-20">
-      <div className="relative">
-        <Loader2 className="w-10 h-10 text-primary animate-spin" />
-      </div>
-      <div>
-        <h4 className="text-base font-bold text-text-main mb-1">Agent Sedang Bekerja</h4>
-        <p className="text-text-muted text-xs max-w-xs mx-auto">Mohon tunggu sebentar, sistem sedang memproses data untuk langkah ini.</p>
-      </div>
+    <div className="flex flex-col items-center justify-center p-10 text-center space-y-4">
+      <CheckCircle2 className="w-16 h-16 text-success opacity-50" />
+      <p className="text-text-muted font-medium">Proses agen selesai. Data tersimpan di database.</p>
     </div>
   );
 }
+
 
 function DataBox({ label, value }: { label: string, value: string }) {
   return (
@@ -803,147 +820,126 @@ function DataBox({ label, value }: { label: string, value: string }) {
   );
 }
 
-function CheckItem({ label, checked }: { label: string, checked: boolean }) {
-  return (
-    <div className="flex items-center gap-3 py-3 border-b border-white/5 last:border-0">
-      <div className={cn("w-5 h-5 rounded-lg flex items-center justify-center text-[10px] border transition-all", 
-        checked ? "bg-success border-success text-bg shadow-[0_0_10px_rgba(0,245,212,0.3)]" : "border-white/10 text-white/20")}>
-        {checked ? '✓' : '○'}
-      </div>
-      <span className={cn("text-[11px] font-bold uppercase tracking-widest", checked ? "text-white" : "text-text-muted")}>{label}</span>
-    </div>
-  );
-}
+function LoginView({ onLogin, onSwitchToSignup }: any) {
+  const [email, setEmail] = useState('');
+  const [password, setPassword] = useState('');
+  const [loading, setLoading] = useState(false);
+  const [error, setError] = useState<string | null>(null);
 
-function ScoreCard({ label, score, color }: { label: string, score: number, color: string }) {
-  return (
-    <div className="p-6 bg-white/5 rounded-3xl border border-white/10 text-center relative overflow-hidden group">
-      <div className="absolute inset-0 bg-gradient-to-b from-white/5 to-transparent opacity-0 group-hover:opacity-100 transition-opacity" />
-      <p className="text-[9px] font-black text-text-muted uppercase tracking-[0.2em] mb-4 relative z-10">{label}</p>
-      <div className={cn("text-4xl font-black italic tracking-tighter mb-4 relative z-10", color)}>{score}</div>
-      <div className="w-full h-1.5 bg-white/10 rounded-full overflow-hidden relative z-10">
-        <motion.div 
-          initial={{ width: 0 }}
-          animate={{ width: `${score}%` }}
-          className={cn("h-full shadow-[0_0_10px_rgba(255,255,255,0.3)]", color.replace('text-', 'bg-'))} 
-        />
-      </div>
-    </div>
-  );
-}
+  const handleLogin = async () => {
+    setLoading(true);
+    setError(null);
+    const { error } = await supabase.auth.signInWithPassword({ email, password });
+    if (error) setError(error.message);
+    else onLogin();
+    setLoading(false);
+  };
 
-function LoginView({ onLogin, onSwitchToSignup }: { onLogin: () => void, onSwitchToSignup: () => void }) {
   return (
-    <div className="min-h-[calc(100vh-70px)] flex items-center justify-center p-6 relative overflow-hidden">
-      <div className="absolute top-1/2 left-1/2 -translate-x-1/2 -translate-y-1/2 w-[600px] h-[600px] bg-primary/10 blur-[150px] rounded-full" />
-      
-      <motion.div 
-        initial={{ opacity: 0, scale: 0.9 }}
-        animate={{ opacity: 1, scale: 1 }}
-        className="max-w-md w-full glass-panel rounded-[2.5rem] p-10 relative z-10 space-y-8"
-      >
+    <div className="min-h-[calc(100vh-70px)] flex items-center justify-center p-6">
+      <div className="max-w-md w-full glass-panel rounded-[2.5rem] p-10 space-y-8">
         <div className="text-center space-y-2">
           <h2 className="text-3xl font-black italic tracking-tighter text-white uppercase">Welcome Back</h2>
           <p className="text-xs text-text-muted font-bold uppercase tracking-widest">Login to your WINNER account</p>
         </div>
-
         <div className="space-y-4">
-          <div className="space-y-2">
-            <label className="text-[10px] font-black text-text-muted uppercase tracking-[0.2em] ml-1">Email Address</label>
-            <input 
-              type="email" 
-              placeholder="name@company.com"
-              className="w-full bg-white/5 border border-white/10 rounded-2xl px-6 py-4 text-white focus:outline-none focus:border-primary transition-all placeholder:text-white/10"
-            />
-          </div>
-          <div className="space-y-2">
-            <label className="text-[10px] font-black text-text-muted uppercase tracking-[0.2em] ml-1">Password</label>
-            <input 
-              type="password" 
-              placeholder="••••••••"
-              className="w-full bg-white/5 border border-white/10 rounded-2xl px-6 py-4 text-white focus:outline-none focus:border-primary transition-all placeholder:text-white/10"
-            />
-          </div>
+          <input 
+            type="email" 
+            placeholder="Email" 
+            value={email} 
+            onChange={e => setEmail(e.target.value)}
+            className="w-full bg-white/5 border border-white/10 rounded-2xl px-6 py-4 text-white"
+          />
+          <input 
+            type="password" 
+            placeholder="Password" 
+            value={password} 
+            onChange={e => setPassword(e.target.value)}
+            className="w-full bg-white/5 border border-white/10 rounded-2xl px-6 py-4 text-white"
+          />
         </div>
-
+        {error && <p className="text-red-400 text-[10px] font-bold uppercase text-center">{error}</p>}
         <button 
-          onClick={onLogin}
-          className="w-full py-4 bg-primary text-bg font-black uppercase tracking-widest rounded-2xl shadow-[0_0_30px_rgba(0,242,254,0.3)] hover:scale-[1.02] active:scale-[0.98] transition-all"
+          onClick={handleLogin} 
+          disabled={loading}
+          className="w-full py-4 bg-primary text-bg font-black uppercase tracking-widest rounded-2xl"
         >
-          Sign In
+          {loading ? 'Signing In...' : 'Sign In'}
         </button>
-
         <div className="text-center">
-          <button 
-            onClick={onSwitchToSignup}
-            className="text-[10px] font-bold text-text-muted hover:text-primary uppercase tracking-widest transition-colors"
-          >
+          <button onClick={onSwitchToSignup} className="text-[10px] font-bold text-text-muted uppercase tracking-widest">
             Don't have an account? <span className="text-primary underline">Sign Up</span>
           </button>
         </div>
-      </motion.div>
+      </div>
     </div>
   );
 }
 
-function SignupView({ onSignup, onSwitchToLogin }: { onSignup: () => void, onSwitchToLogin: () => void }) {
+function SignupView({ onSignup, onSwitchToLogin }: any) {
+  const [email, setEmail] = useState('');
+  const [password, setPassword] = useState('');
+  const [fullName, setFullName] = useState('');
+  const [loading, setLoading] = useState(false);
+  const [error, setError] = useState<string | null>(null);
+
+  const handleSignup = async () => {
+    setLoading(true);
+    setError(null);
+    const { error } = await supabase.auth.signUp({ 
+      email, 
+      password,
+      options: { data: { full_name: fullName } }
+    });
+    if (error) setError(error.message);
+    else onSignup();
+    setLoading(false);
+  };
+
   return (
-    <div className="min-h-[calc(100vh-70px)] flex items-center justify-center p-6 relative overflow-hidden">
-      <div className="absolute top-1/2 left-1/2 -translate-x-1/2 -translate-y-1/2 w-[600px] h-[600px] bg-accent/10 blur-[150px] rounded-full" />
-      
-      <motion.div 
-        initial={{ opacity: 0, scale: 0.9 }}
-        animate={{ opacity: 1, scale: 1 }}
-        className="max-w-md w-full glass-panel rounded-[2.5rem] p-10 relative z-10 space-y-8"
-      >
+    <div className="min-h-[calc(100vh-70px)] flex items-center justify-center p-6">
+      <div className="max-w-md w-full glass-panel rounded-[2.5rem] p-10 space-y-8">
         <div className="text-center space-y-2">
           <h2 className="text-3xl font-black italic tracking-tighter text-white uppercase">Create Account</h2>
           <p className="text-xs text-text-muted font-bold uppercase tracking-widest">Join the WINNER ecosystem</p>
         </div>
-
         <div className="space-y-4">
-          <div className="space-y-2">
-            <label className="text-[10px] font-black text-text-muted uppercase tracking-[0.2em] ml-1">Full Name</label>
-            <input 
-              type="text" 
-              placeholder="John Doe"
-              className="w-full bg-white/5 border border-white/10 rounded-2xl px-6 py-4 text-white focus:outline-none focus:border-primary transition-all placeholder:text-white/10"
-            />
-          </div>
-          <div className="space-y-2">
-            <label className="text-[10px] font-black text-text-muted uppercase tracking-[0.2em] ml-1">Email Address</label>
-            <input 
-              type="email" 
-              placeholder="name@company.com"
-              className="w-full bg-white/5 border border-white/10 rounded-2xl px-6 py-4 text-white focus:outline-none focus:border-primary transition-all placeholder:text-white/10"
-            />
-          </div>
-          <div className="space-y-2">
-            <label className="text-[10px] font-black text-text-muted uppercase tracking-[0.2em] ml-1">Password</label>
-            <input 
-              type="password" 
-              placeholder="••••••••"
-              className="w-full bg-white/5 border border-white/10 rounded-2xl px-6 py-4 text-white focus:outline-none focus:border-primary transition-all placeholder:text-white/10"
-            />
-          </div>
+          <input 
+            type="text" 
+            placeholder="Full Name" 
+            value={fullName} 
+            onChange={e => setFullName(e.target.value)}
+            className="w-full bg-white/5 border border-white/10 rounded-2xl px-6 py-4 text-white"
+          />
+          <input 
+            type="email" 
+            placeholder="Email" 
+            value={email} 
+            onChange={e => setEmail(e.target.value)}
+            className="w-full bg-white/5 border border-white/10 rounded-2xl px-6 py-4 text-white"
+          />
+          <input 
+            type="password" 
+            placeholder="Password" 
+            value={password} 
+            onChange={e => setPassword(e.target.value)}
+            className="w-full bg-white/5 border border-white/10 rounded-2xl px-6 py-4 text-white"
+          />
         </div>
-
+        {error && <p className="text-red-400 text-[10px] font-bold uppercase text-center">{error}</p>}
         <button 
-          onClick={onSignup}
-          className="w-full py-4 bg-accent text-bg font-black uppercase tracking-widest rounded-2xl shadow-[0_0_30px_rgba(240,147,251,0.3)] hover:scale-[1.02] active:scale-[0.98] transition-all"
+          onClick={handleSignup} 
+          disabled={loading}
+          className="w-full py-4 bg-accent text-bg font-black uppercase tracking-widest rounded-2xl"
         >
-          Create Account
+          {loading ? 'Creating Account...' : 'Create Account'}
         </button>
-
         <div className="text-center">
-          <button 
-            onClick={onSwitchToLogin}
-            className="text-[10px] font-bold text-text-muted hover:text-accent uppercase tracking-widest transition-colors"
-          >
+          <button onClick={onSwitchToLogin} className="text-[10px] font-bold text-text-muted uppercase tracking-widest">
             Already have an account? <span className="text-accent underline">Login</span>
           </button>
         </div>
-      </motion.div>
+      </div>
     </div>
   );
 }

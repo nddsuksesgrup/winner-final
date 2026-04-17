@@ -82,14 +82,16 @@ export interface WorkflowState {
   niche: string;
   targetMarket: string;
   results: {
-    keyword?: KeywordOutput;
-    strategy?: StrategyOutput;
-    writing?: WritingOutput;
-    image?: ImageOutput;
-    revision?: RevisionOutput;
-    seo?: SEOOutput;
-    publish?: PublishOutput;
-    rating?: RatingOutput;
+    keyword?: KeywordOutput | any;
+    strategy?: StrategyOutput | any;
+    writing?: WritingOutput | any;
+    image?: ImageOutput | any;
+    revision?: RevisionOutput | any;
+    seo?: SEOOutput | any;
+    publish?: PublishOutput | any;
+    rating?: RatingOutput | any;
   };
   statuses: AgentStatus[];
+  thread_id?: string;
+  isPaused?: boolean;
 }
