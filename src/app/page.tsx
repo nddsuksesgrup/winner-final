@@ -15,7 +15,8 @@ import {
   Settings, 
   History,
   ArrowRight,
-  AlertCircle
+  AlertCircle,
+  CreditCard
 } from 'lucide-react';
 import { motion, AnimatePresence } from 'motion/react';
 import { cn } from '../lib/utils';
@@ -27,6 +28,10 @@ import { geminiService } from '../services/geminiService';
 import { supabase } from '../lib/supabase';
 import { wahaService } from '../services/wahaService';
 import { agentService } from '../services/agentService';
+import { TopUpView } from '../components/TopUpView';
+import { SettingsView } from '../components/SettingsView';
+import { ChatBotPopup } from '../components/ChatBotPopup';
+import { RevisionView } from '../components/RevisionView';
 
 const STEPS = [
   { id: 1, name: 'Keyword Agent', icon: Search, color: 'text-blue-600' },
@@ -68,8 +73,9 @@ const parseAgentOutput = (raw: string | undefined | null, stepName: string) => {
 };
 
 export default function Home() {
-  const [activeView, setActiveView] = useState<'dashboard' | 'history' | 'settings' | 'login' | 'signup'>('dashboard');
+  const [activeView, setActiveView] = useState<'dashboard' | 'history' | 'settings' | 'login' | 'signup' | 'topup'>('dashboard');
   const [isAuthenticated, setIsAuthenticated] = useState(false);
+  const [creditBalance, setCreditBalance] = useState(120); // Initial dummy balance
   const [feedback, setFeedback] = useState('');
   const [state, setState] = useState<WorkflowState>({
     currentStep: 0,
@@ -294,6 +300,15 @@ export default function Home() {
           ) : (
             <div className="flex items-center gap-4">
               <button 
+                onClick={() => setActiveView('topup')}
+                className="flex items-center gap-2 px-4 py-1.5 bg-primary/10 border border-primary/20 hover:bg-primary/20 rounded-full transition-colors group"
+              >
+                <div className="w-5 h-5 rounded-full bg-primary/20 flex items-center justify-center">
+                  <CreditCard className="w-3 h-3 text-primary group-hover:scale-110 transition-transform" />
+                </div>
+                <span className="text-[11px] font-black uppercase tracking-widest text-primary">{creditBalance} Kredit</span>
+              </button>
+              <button 
                 onClick={async () => {
                   await supabase.auth.signOut();
                   setIsAuthenticated(false);
@@ -332,6 +347,12 @@ export default function Home() {
                 label="Settings" 
                 active={activeView === 'settings'} 
                 onClick={() => setActiveView('settings')}
+              />
+              <NavItem 
+                icon={CreditCard} 
+                label="Top-Up Saldo" 
+                active={activeView === 'topup'} 
+                onClick={() => setActiveView('topup')}
               />
             </nav>
           </div>
@@ -418,27 +439,9 @@ export default function Home() {
             )}
           </div>
         ) : activeView === 'settings' ? (
-          <div className="p-10 max-w-5xl mx-auto">
-            <h2 className="text-3xl font-black italic tracking-tighter mb-8 text-primary">SETTINGS</h2>
-            <div className="glass-panel rounded-3xl p-10 space-y-8">
-              <div className="grid grid-cols-1 md:grid-cols-2 gap-8">
-                <div className="space-y-3">
-                  <label className="text-[10px] font-black text-text-muted uppercase tracking-[0.2em] block">AI Model Preference</label>
-                  <select className="w-full bg-white/5 border border-white/10 rounded-xl px-4 py-3 text-sm text-white focus:outline-none focus:border-primary transition-colors">
-                    <option className="bg-bg">Gemini 1.5 Pro (Writing)</option>
-                    <option className="bg-bg">Gemini 1.5 Flash (Analysis)</option>
-                  </select>
-                </div>
-                <div className="space-y-3">
-                  <label className="text-[10px] font-black text-text-muted uppercase tracking-[0.2em] block">Default Language</label>
-                  <select className="w-full bg-white/5 border border-white/10 rounded-xl px-4 py-3 text-sm text-white focus:outline-none focus:border-primary transition-colors">
-                    <option className="bg-bg">Bahasa Indonesia</option>
-                    <option className="bg-bg">English</option>
-                  </select>
-                </div>
-              </div>
-            </div>
-          </div>
+          <SettingsView />
+        ) : activeView === 'topup' ? (
+          <TopUpView currentBalance={creditBalance} />
         ) : !isStarted ? (
           <LandingView 
             niche={state.niche}
@@ -480,7 +483,13 @@ export default function Home() {
                     {state.statuses[state.currentStep - 1] === AgentStatus.RUNNING && (
                       <div className="flex items-center gap-3 px-4 py-2 bg-primary/10 rounded-full text-[10px] font-black text-primary uppercase tracking-widest border border-primary/20">
                         <Loader2 className="w-3 h-3 animate-spin" />
-                        Processing
+                        {state.currentStep === 1 ? 'Menganalisis Kompetitor...' :
+                         state.currentStep === 2 ? 'Menyusun Strategi...' :
+                         state.currentStep === 3 ? 'Menulis Draf...' :
+                         state.currentStep === 4 ? 'Membuat Prompt Gambar...' :
+                         state.currentStep === 5 ? 'Memproses Revisi...' :
+                         state.currentStep === 6 ? 'Optimasi SEO...' :
+                         state.currentStep === 7 ? 'Mempublikasikan ke WP...' : 'Memproses...'}
                       </div>
                     )}
                   </header>
@@ -530,6 +539,7 @@ export default function Home() {
             </div>
           </div>
         )}
+        <ChatBotPopup />
       </main>
     </div>
   );
@@ -641,6 +651,10 @@ function LandingView({ niche, targetMarket, setNiche, setTargetMarket, onStart, 
                   onChange={(e) => setNiche(e.target.value)}
                   className="w-full bg-white/5 border border-white/10 rounded-2xl px-6 py-4 text-white focus:outline-none focus:ring-2 focus:ring-primary/20 focus:border-primary transition-all placeholder:text-white/20"
                 />
+                <div className="flex flex-wrap gap-2 mt-2">
+                  <button onClick={() => setNiche('Jual Rumah Minimalis')} className="text-[9px] bg-primary/10 hover:bg-primary/20 text-primary border border-primary/20 rounded-full px-3 py-1 transition-colors">Contoh: Jual Rumah Minimalis</button>
+                  <button onClick={() => setNiche('Jasa SEO Jakarta')} className="text-[9px] bg-primary/10 hover:bg-primary/20 text-primary border border-primary/20 rounded-full px-3 py-1 transition-colors">Contoh: Jasa SEO Jakarta</button>
+                </div>
               </div>
               <div className="space-y-3">
                 <label className="text-[10px] font-black text-text-muted uppercase tracking-[0.2em] block ml-1">Target Market</label>
@@ -745,61 +759,33 @@ function renderStepOutput(
 
   if (currentStep >= 3 && results.writing) {
     const w = results.writing;
-    return (
-      <div className="space-y-6 max-h-[500px] overflow-y-auto pr-4 custom-scrollbar">
-        <h4 className="text-xl font-bold text-white">{w.title}</h4>
-        <p className="text-text-muted text-sm leading-relaxed italic border-l-2 border-primary pl-4">{w.intro}</p>
-        <div className="space-y-8">
-          {w.sections?.map((sec: any, i: number) => (
-            <div key={i} className="space-y-3">
-              <h5 className="text-base font-bold text-white">{sec.heading}</h5>
-              <div className="text-text-muted text-sm leading-relaxed space-y-4">
-                {sec.content?.split('\n')?.map((p: string, pi: number) => (
-                  <p key={pi}>{p}</p>
-                ))}
-              </div>
-            </div>
-          ))}
-        </div>
-        <div className="p-6 bg-primary/5 border border-primary/10 rounded-lg">
-          <p className="text-white text-sm mb-4">{w.closing}</p>
-          <button className="px-6 py-2 bg-primary text-bg rounded font-bold text-xs shadow-md shadow-primary/10">
-            {w.cta}
-          </button>
-        </div>
-
-        {/* Human in the loop Pause UI */}
-        {state.isPaused && (
-          <div className="mt-8 p-6 bg-white/5 border-2 border-primary/50 rounded-2xl">
-            <h3 className="text-primary font-bold text-lg mb-2">Tinjauan Manual Diperlukan</h3>
-            <p className="text-text-muted text-sm mb-4">Agen telah selesai menulis draf awal. Silakan review artikel di atas. Apakah Anda ingin melanjutkan publikasi atau merevisi?</p>
-            <div className="space-y-4">
-              <textarea 
-                className="w-full bg-black/30 border border-white/10 rounded-lg p-3 text-sm text-white placeholder:text-white/30 focus:outline-none focus:border-primary/50"
-                placeholder="Catatan revisi (opsional)... misal: 'Tolong buat paragraf pertama lebih panjang'"
-                rows={3}
-                value={feedback}
-                onChange={e => setFeedback(e.target.value)}
-              />
-              <div className="flex gap-4">
-                <button 
-                  onClick={() => resumeWorkflow('REVISE')}
-                  className="flex-1 py-3 bg-white/5 border border-white/10 rounded-lg text-white font-bold hover:bg-white/10 transition"
-                >
-                  Revisi
-                </button>
-                <button 
-                  onClick={() => resumeWorkflow('APPROVE')}
-                  className="flex-1 py-3 bg-primary text-bg rounded-lg font-bold shadow-lg shadow-primary/20 hover:shadow-primary/40 transition"
-                >
-                  Approve & Lanjut
-                </button>
-              </div>
-            </div>
+    const markdownContent = w.title === "Draf Artikel (Raw Text)" && w.sections && w.sections.length > 0
+      ? w.sections[0].content 
+      : `# ${w.title}\n\n_${w.intro}_\n\n${w.sections?.map((s: any) => `## ${s.heading}\n${s.content}`).join('\n\n')}\n\n${w.closing}\n\n**${w.cta}**`;
+      
+    // If we are at step 3 or paused, show RevisionView, otherwise it's completed and moved to Step 4+, so maybe we just show a preview
+    if (state.isPaused || currentStep === 3) {
+      return (
+        <RevisionView 
+          content={markdownContent}
+          feedback={feedback}
+          setFeedback={setFeedback}
+          onResume={resumeWorkflow}
+          seoScore={state.results.rating?.seoScore || 85}
+        />
+      );
+    } else {
+      // Small preview if completed
+      return (
+        <div className="p-6 bg-success/10 border border-success/20 rounded-2xl flex items-center gap-4">
+          <CheckCircle2 className="w-8 h-8 text-success" />
+          <div>
+            <h4 className="text-sm font-bold text-white">Artikel Disetujui</h4>
+            <p className="text-xs text-text-muted">Draft telah dikonfirmasi dan dilanjutkan ke proses berikutnya.</p>
           </div>
-        )}
-      </div>
-    );
+        </div>
+      );
+    }
   }
 
   return (
